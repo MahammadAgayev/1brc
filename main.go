@@ -106,7 +106,7 @@ func main() {
 	}
 
 	for k, v := range aggr.data {
-		out.WriteString(fmt.Sprintf("%s:%f,%f,%d,%f\n", k, float64(v.Min/10.0), float64(v.Max/10.0), v.Count, float64(v.Sum/v.Count)/10.0))
+		out.WriteString(fmt.Sprintf("%s:%f,%f,%f\n", k, float64(v.Min/10.0), float64(v.Max/10.0), float64(v.Sum/v.Count)/10.0))
 	}
 }
 

@@ -2,7 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"os"
@@ -12,9 +15,6 @@ import (
 	"sync/atomic"
 	"time"
 )
-
-var ParserCount int = 1
-var AggregatorCount int = 1
 
 type Aggregation struct {
 	data map[string]*Measurement
@@ -49,30 +49,22 @@ func (af *AtomicFloat64) Add(delta float64) float64 {
 }
 
 type Measurement struct {
-	Min   float64
-	Sum   float64
+	Min   int
+	Sum   int
 	Count int
-	Max   float64
+	Max   int
 
 	mu sync.Mutex
 }
 
 type ParsedInfo struct {
 	City        string
-	Temperature float64
+	Temperature int
 }
 
 func main() {
 	filename := os.Args[1]
 	f, err := os.Open(filename)
-
-	if len(os.Args) > 2 {
-		ParserCount, _ = strconv.Atoi(os.Args[2])
-	}
-
-	if len(os.Args) > 3 {
-		AggregatorCount, _ = strconv.Atoi(os.Args[3])
-	}
 
 	if err != nil {
 		log.Panicln(err)
@@ -82,48 +74,31 @@ func main() {
 		data: make(map[string]*Measurement),
 	}
 
-	parserPipe := make(chan string, 10_000_000)
-	aggPipe := make(chan ParsedInfo, 10_000_000)
+	aggPipe := make(chan *ParsedInfo, 10_000_000)
 
 	// go func(parserPipe chan string, aggPipe chan ParsedInfo) {
 	// 	for {
 	// 		log.Println(len(parserPipe), len(aggPipe))
 	// 		time.Sleep(time.Millisecond * 500)
 	// 	}
-
 	// }(parserPipe, aggPipe)
 
-	scanner := bufio.NewScanner(f)
+	reader := bufio.NewReader(f)
 
+	now := time.Now()
 	parserWg := &sync.WaitGroup{}
-	for i := 0; i < ParserCount; i++ {
-		parserWg.Add(1)
-		go Parser(parserPipe, aggPipe, parserWg)
-	}
+	parserWg.Add(1)
+	go AnotherParser(reader, aggPipe, parserWg)
 
 	aggrWg := &sync.WaitGroup{}
-	for i := 0; i < AggregatorCount; i++ {
-		aggrWg.Add(1)
-		go aggr.Aggregator(aggPipe, aggrWg)
-	}
+	aggrWg.Add(1)
+	go aggr.Aggregator(aggPipe, aggrWg)
 
-	readTime := time.Now()
-	for scanner.Scan() {
-		text := scanner.Text()
-		parserPipe <- text
-	}
-
-	log.Println("reading file finished in", time.Since(readTime))
-
-	//close parses and wait until parsers finished
-	close(parserPipe)
 	parserWg.Wait()
+	log.Println("parser finished", time.Since(now))
 
-	//close aggrs and wait until aggregators finished
 	close(aggPipe)
 	aggrWg.Wait()
-
-	log.Println("aggregated printing out data")
 
 	out, err := os.Create("out.txt")
 	if err != nil {
@@ -131,25 +106,19 @@ func main() {
 	}
 
 	for k, v := range aggr.data {
-		out.WriteString(fmt.Sprintf("%s:%f,%f,%d,%f\n", k, v.Min, v.Max, v.Count, v.Sum/float64(v.Count)))
+		out.WriteString(fmt.Sprintf("%s:%f,%f,%d,%f\n", k, float64(v.Min/10.0), float64(v.Max/10.0), v.Count, float64(v.Sum/v.Count)/10.0))
 	}
 }
 
-func (a *Aggregation) Aggregator(aggPipe chan ParsedInfo, wg *sync.WaitGroup) {
+func (a *Aggregation) Aggregator(aggPipe chan *ParsedInfo, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	sum := float64(0)
-	count := 0
 	now := time.Now()
 
 	for v := range aggPipe {
-		now := time.Now()
-		a.mu.RLock()
 		measure, ok := a.data[v.City]
-		a.mu.RUnlock()
 
 		if ok {
-			measure.mu.Lock()
 			measure.Count += 1
 			measure.Sum += v.Temperature
 
@@ -160,9 +129,7 @@ func (a *Aggregation) Aggregator(aggPipe chan ParsedInfo, wg *sync.WaitGroup) {
 			if v.Temperature > measure.Max {
 				measure.Max = v.Temperature
 			}
-			measure.mu.Unlock()
 		} else {
-			a.mu.Lock()
 			a.data[v.City] = &Measurement{
 				Count: 1,
 				Sum:   v.Temperature,
@@ -170,14 +137,9 @@ func (a *Aggregation) Aggregator(aggPipe chan ParsedInfo, wg *sync.WaitGroup) {
 				Max:   v.Temperature,
 				mu:    sync.Mutex{},
 			}
-			a.mu.Unlock()
 		}
-
-		count++
-		sum += time.Since(now).Seconds()
 	}
 
-	log.Println("avg duration for aggregator goroutine", sum/float64(count))
 	log.Println("total execution duration for aggregator", time.Since(now))
 }
 
@@ -192,7 +154,7 @@ func Parser(parserPipe chan string, aggrPipe chan ParsedInfo, wg *sync.WaitGroup
 		now := time.Now()
 		parts := strings.Split(str, ";")
 
-		num, err := strconv.ParseFloat(parts[1], 64)
+		num, err := strconv.Atoi(parts[1])
 
 		if err != nil {
 			log.Fatalln("unable to parse input data", str)
@@ -211,4 +173,46 @@ func Parser(parserPipe chan string, aggrPipe chan ParsedInfo, wg *sync.WaitGroup
 
 	log.Println("avg duration for parser goroutine", sum/float64(count))
 	log.Println("total execution duration for parser", time.Since(now))
+}
+
+func AnotherParser(reader *bufio.Reader, aggrPipe chan *ParsedInfo, wg *sync.WaitGroup) error {
+	defer wg.Done()
+
+	for {
+		slice, err := reader.ReadSlice('\n')
+
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+
+		if err != nil {
+			return err
+		}
+
+		idxSemicolon := bytes.Index(slice, []byte{0x3B})
+
+		info := &ParsedInfo{
+			City:        string(slice[:idxSemicolon]),
+			Temperature: ParseInt(slice[idxSemicolon:]),
+		}
+
+		aggrPipe <- info
+	}
+}
+
+func ParseInt(slice []byte) int {
+	var sign int
+
+	if slice[0] == '-' {
+		slice = slice[1:]
+		sign = -1
+	} else {
+		sign = 1
+	}
+
+	if slice[1] == '.' {
+		return (int(slice[0])*10 + int(slice[2]) - int('0')*11) * sign
+	}
+
+	return (int(slice[0])*100 + int(slice[1])*10 + int(slice[3]) - int('0')*111) * sign
 }
